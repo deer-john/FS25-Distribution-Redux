@@ -9446,11 +9446,11 @@ function SmartDistribution._isDefaultPalletType(spawner, ft, filename)
     return entry ~= nil and entry.filename == filename
 end
 
--- Is a manual "Spawn Pallets" action meaningful for (asset, ft)? Requires Hold Internal AND at least one
--- FULL pallet's worth held internally. Handles productions (storage) and pallet-spawner husbandries
+-- Is a manual "Spawn Pallets" action meaningful for (asset, ft)?
+-- Requires at least 300 L held internally (the last pallet may be partial). Handles productions (storage) and pallet-spawner husbandries
 -- (pending buffer). Single gate for the footer button on every page + the vanilla-menu hooks, so the
 -- button is hidden below one pallet's worth everywhere.
--- Offered whenever the building is holding a full pallet's worth internally, in ANY mode.
+-- Offered whenever the building is holding at least 100 L internally, in ANY mode.
 --
 -- It used to require HOLD_INTERNAL, which made sense while that was the only mode that accumulated a
 -- buffer -- 5.20 already logged the gap as a "convenience gap rather than stuck product". With pallet
@@ -9462,12 +9462,12 @@ function SmartDistribution.palletSpawnReady(asset, ft)
     if pp ~= nil then
         local cap  = SmartDistribution.palletCapacityFor(pp, ft)
         local held = (pp.getFillLevel ~= nil and pp:getFillLevel(ft)) or 0
-        return cap ~= nil and cap > 0 and held >= cap
+        return cap ~= nil and cap > 0 and held >= 100
     end
     if asset.spec_husbandryPallets ~= nil then
         local cap  = SmartDistribution.palletCapacityForHusbandry(asset, ft)
         local held = SmartDistribution.palletPendingLiters(asset, ft)
-        return cap ~= nil and cap > 0 and held >= cap
+        return cap ~= nil and cap > 0 and held >= 100
     end
     return false
 end
