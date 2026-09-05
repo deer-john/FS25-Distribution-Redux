@@ -9447,7 +9447,7 @@ function SmartDistribution._isDefaultPalletType(spawner, ft, filename)
 end
 
 -- Is a manual "Spawn Pallets" action meaningful for (asset, ft)?
--- Requires at least 300 L held internally (the last pallet may be partial). Handles productions (storage) and pallet-spawner husbandries
+-- Requires at least 100 L held internally (the last pallet may be partial). Handles productions (storage) and pallet-spawner husbandries
 -- (pending buffer). Single gate for the footer button on every page + the vanilla-menu hooks, so the
 -- button is hidden below one pallet's worth everywhere.
 -- Offered whenever the building is holding at least 100 L internally, in ANY mode.
