@@ -117,16 +117,16 @@ local MODE_ARROWS = { "modePrev", "modeNext" }
 
 -- Bind the arrows on ONE row, and show or hide them.
 -- The function now receives the *asset* being displayed so it can decide whether the
--- asset is a bunker‑silo that is currently filling or fermenting.
+-- asset is a bunker-silo that is currently filling or fermenting.
 local function setModeArrows(cell, ft, asset)
     --------------------------------------------------------------------
-    -- 1) Existing rule – hide when there is no fill‑type.
+    -- 1) Existing rule - hide when there is no fill-type.
     --------------------------------------------------------------------
     local hideArrows = (ft == nil)
 
     --------------------------------------------------------------------
-    -- 2) New rule – hide when the asset is a bunker‑silo in a
-    --    non‑editable stage (filling / fermenting).
+    -- 2) New rule - hide when the asset is a bunker-silo in a
+    --    non-editable stage (filling / fermenting).
     --------------------------------------------------------------------
     if not hideArrows and asset ~= nil
        and SmartDistribution ~= nil
@@ -142,7 +142,7 @@ local function setModeArrows(cell, ft, asset)
 
     --------------------------------------------------------------------
     -- 3) Apply the visibility to each arrow button.
-    --    When hidden we also clear the stored fill‑type so that a click
+    --    When hidden we also clear the stored fill-type so that a click
     --    cannot act on a stale value (mirrors the original `ft == nil`
     --    behaviour).
     --------------------------------------------------------------------
@@ -404,18 +404,24 @@ local function setCombinedStatusCell(cell, placeable, ft, window, role)
     local cSep = cell:getAttribute("statusSep")
     local cOut = cell:getAttribute("statusOut")
     if cIn == nil and cOut == nil then return end
-    
-    -- SILOS ARE OUTPUT-ONLY: hide the receive status for silos
-    local isSilo = (SmartDistribution ~= nil and SmartDistribution.isBunkerSiloPlaceable ~= nil and 
-                   SmartDistribution.isBunkerSiloPlaceable(placeable)) or
-                  (placeable ~= nil and placeable.spec_silo ~= nil)
-    
+
+    -- A SEALED BUNKER IS OUTPUT-ONLY, AND ONLY A BUNKER. DR can never deposit into a terrain
+    -- heap, so a bunker's IN half would assert a state nothing enforces. It must NOT reach an
+    -- ORDINARY silo, which is the archetypal In/Out building -- it receives and supplies, which
+    -- is why Advanced Inputs, input blocking and the feed count all apply to it.
+    -- The two are disjoint by getAssetClass's own test: `p.spec_silo ~= nil` is how an ordinary
+    -- silo is identified, and the bunker branch is reached only when that is nil -- so testing
+    -- spec_silo here added nothing for bunkers while suppressing the IN status (the "Blocked"
+    -- indicator, 5.6, and inputLinkStatus) on every ordinary silo.
+    local isBunker = SmartDistribution ~= nil and SmartDistribution.isBunkerSiloPlaceable ~= nil
+                     and SmartDistribution.isBunkerSiloPlaceable(placeable)
+
     local inSt, outSt = nil, nil
     if placeable ~= nil and ft ~= nil and SmartDistribution ~= nil and SmartDistribution.assetUid ~= nil then
         local uid = SmartDistribution.assetUid(placeable)
         if uid ~= nil then
-            -- Skip input status for silos (they only output, never receive)
-            if not isSilo then
+            -- Skip the input status for a BUNKER only (see isBunker above)
+            if not isBunker then
                 if SmartDistribution.isInputBlocked ~= nil and SmartDistribution.isInputBlocked(
                        (SmartDistribution.settingUid ~= nil)
                            and SmartDistribution.settingUid(placeable, ft, role) or uid, ft) then
@@ -765,8 +771,6 @@ function DistributionStoragePage:populateCellForItemInSection(list, section, ind
         end
     end
 
-
-
     -- BOTH directions in the one status cell now that there is one row per product
     setCombinedStatusCell(cell, self.selectedAsset, row.ft, self:currentWindow(), self.selectedRole)
 end
@@ -918,7 +922,6 @@ function DistributionStoragePage:stepRowMode(dir, ...)
     local el = clickedArrow(...)
     local ft = (el ~= nil) and el.sdFillType or nil
     if ft == nil or self.selectedAsset == nil then return end
-        local bs
     if SmartDistribution.bunkerIsSealed ~= nil and SmartDistribution.bunkerIsSealed(self.selectedAsset) then return end
     local cur = SmartDistribution.resolvedAssetMode(self.selectedAsset, ft, self.selectedRole)
     local nxt
@@ -964,7 +967,6 @@ DistributionStoragePage.MODE_KEYS_ENABLED = true
 function DistributionStoragePage:onCycleSelectedBack()
     local row = self:selectedDetailRow()
     if row == nil or self.selectedAsset == nil then return end
-        local bs
     if SmartDistribution.bunkerIsSealed ~= nil and SmartDistribution.bunkerIsSealed(self.selectedAsset) then return end
     if SmartDistribution.cyclePrevForAsset == nil then return end
     local cur = SmartDistribution.resolvedAssetMode(self.selectedAsset, row.ft, self.selectedRole)
@@ -980,7 +982,6 @@ end
 function DistributionStoragePage:onCycleSelected()
     local row = self:selectedDetailRow()
     if row == nil or self.selectedAsset == nil then return end
-        local bs
     if SmartDistribution.bunkerIsSealed ~= nil and SmartDistribution.bunkerIsSealed(self.selectedAsset) then return end
     local cur = SmartDistribution.resolvedAssetMode(self.selectedAsset, row.ft, self.selectedRole)
     local nxt = (SmartDistribution.cycleNextForAsset and SmartDistribution.cycleNextForAsset(self.selectedAsset, cur, row.ft, self.selectedRole))

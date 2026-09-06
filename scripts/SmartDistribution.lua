@@ -3257,7 +3257,7 @@ local function getActiveHourlyConsumption(pp, ft)
                     -- is invisible in the summed figure -- print it so a half-rate demand names its own
                     -- cause instead of needing to be inferred from a day of totals.
                     if SmartDistribution.debug then
-                        log(" demand %s [%s] line=%s amount=%.1f x cph=%.3f%s -> %.1f/h%s",
+                        log("  demand %s [%s] line=%s amount=%.1f x cph=%.3f%s -> %.1f/h%s",
                             placeableName(pp.owningPlaceable), fillTypeName(ft),
                             tostring(production.name or production.id or "?"),
                             input.amount or 0, cph,
@@ -9458,11 +9458,21 @@ function SmartDistribution._isDefaultPalletType(spawner, ft, filename)
     return entry ~= nil and entry.filename == filename
 end
 
+-- The floor for a MANUAL pallet release. It is deliberately NOT a full pallet: the spawn path
+-- takes an explicit litre budget and drops its own floor to 1 L for it ("the LAST pallet is meant
+-- to be partial"), so requiring a full one only hid the button from a player who wanted the
+-- partial. 100 L keeps a near-empty pallet from being spawned by a stray press.
+-- DR's own AUTOMATIC release is untouched and still emits whole pallets only (5.30) -- this gate
+-- is read from the GUI alone.
+SmartDistribution.PALLET_SPAWN_MIN_L = 100
+
 -- Is a manual "Spawn Pallets" action meaningful for (asset, ft)?
--- Requires at least 100 L held internally (the last pallet may be partial). Handles productions (storage) and pallet-spawner husbandries
--- (pending buffer). Single gate for the footer button on every page + the vanilla-menu hooks, so the
--- button is hidden below one pallet's worth everywhere.
--- Offered whenever the building is holding at least 100 L internally, in ANY mode.
+-- Requires PALLET_SPAWN_MIN_L held internally, or a full pallet's worth where the pallet itself
+-- holds less than that -- BALE_NET (5 L) and BALE_TWINE (24 L) are real pallet types, and a flat
+-- 100 L floor would have made the button HARDER to reach for them than the old full-pallet rule.
+-- Handles productions (storage) and pallet-spawner husbandries (pending buffer). Single gate for
+-- the footer button on every page + the vanilla-menu hooks, so it behaves identically everywhere.
+-- Offered in ANY mode.
 --
 -- It used to require HOLD_INTERNAL, which made sense while that was the only mode that accumulated a
 -- buffer -- 5.20 already logged the gap as a "convenience gap rather than stuck product". With pallet
@@ -9474,12 +9484,12 @@ function SmartDistribution.palletSpawnReady(asset, ft)
     if pp ~= nil then
         local cap  = SmartDistribution.palletCapacityFor(pp, ft)
         local held = (pp.getFillLevel ~= nil and pp:getFillLevel(ft)) or 0
-        return cap ~= nil and cap > 0 and held >= 100
+        return cap ~= nil and cap > 0 and held >= math.min(SmartDistribution.PALLET_SPAWN_MIN_L, cap)
     end
     if asset.spec_husbandryPallets ~= nil then
         local cap  = SmartDistribution.palletCapacityForHusbandry(asset, ft)
         local held = SmartDistribution.palletPendingLiters(asset, ft)
-        return cap ~= nil and cap > 0 and held >= 100
+        return cap ~= nil and cap > 0 and held >= math.min(SmartDistribution.PALLET_SPAWN_MIN_L, cap)
     end
     return false
 end
@@ -20677,7 +20687,10 @@ function SmartDistribution.bunkerOutputFillType(p)
 end
 
 -- What a bunker silo ACCEPTS to ferment (CHAFF on vanilla, ORGANICWASTE on a compost silo).
--- The mirror of bunkerOutputFillType: reads the spec's inputFillType, falls back to CHAFF by name.
+-- The mirror of bunkerOutputFillType, with one deliberate difference: it reads the spec's
+-- inputFillType and returns NIL when that is absent -- it does NOT guess. Naming CHAFF here
+-- would make a compost silo claim to accept the wrong material, the very thing 5.33 fixed on
+-- the output side. Every caller guards for nil.
 function SmartDistribution.bunkerInputFillType(p)
     if p == nil then return nil end
     local silo = SmartDistribution.bunkerSiloObject(p)

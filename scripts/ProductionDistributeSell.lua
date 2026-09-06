@@ -689,7 +689,9 @@ end
 -- Appends to updateMenuButtons (where the frame rebuilds its footer) and adds a button when the selected
 -- production has a Hold Internal output; it opens the shared spawn dialog for that output.
 if InGameMenuProductionFrame ~= nil and InGameMenuProductionFrame.updateMenuButtons ~= nil then
-    -- the selected product qualifies only if it's a Hold Internal output holding at least 100 L
+    -- the selected product qualifies only if it's a Hold Internal output holding at least
+    -- PALLET_SPAWN_MIN_L -- or a full pallet where the pallet holds less than that (see
+    -- palletSpawnReady, whose rule this mirrors)
     local function spawnableSelection(frame)
         if frame == nil or frame.getSelectedProduction == nil then return nil end
         local production, pp = frame:getSelectedProduction()
@@ -700,7 +702,7 @@ if InGameMenuProductionFrame ~= nil and InGameMenuProductionFrame.updateMenuButt
         if SD.getAssetMode(uidOf(pl), ft) ~= SD.MODE.HOLD_INTERNAL then return nil end
         local cap  = SD.palletCapacityFor and SD.palletCapacityFor(pp, ft) or nil
         local held = pp.getFillLevel and pp:getFillLevel(ft) or 0
-        if cap == nil or cap <= 0 or held < 100 then return nil end
+        if cap == nil or cap <= 0 or held < math.min(SD.PALLET_SPAWN_MIN_L or 100, cap) then return nil end
         return pl, ft
     end
     local function onOwnedTab(frame)
