@@ -214,6 +214,34 @@ DistributionSettings.SETTINGS = {
         values  = { 0.5, 2, 10, -1 },
         strings = { "Live (0.5s)", "Normal (2s)", "Relaxed (10s)", "Manual only" },
     },
+    -- The HOURLY PASS PROFILER (5.89). Writes two lines to log.txt describing what the hourly pass
+    -- cost and -- the half that names a cause rather than a symptom -- how many world scans it made.
+    --
+    -- LOCAL ONLY, for menuRefresh's reason exactly: it is a diagnostic for the machine, not world
+    -- state the server owns. A player asked to help diagnose must be able to turn their OWN logging
+    -- on without the server overwriting it, and without changing anything for anyone else.
+    --
+    -- THREE STATES, NOT ON/OFF, and the middle one is the current shipped behaviour so nothing
+    -- changes by default:
+    --   Off              -- silent, including the one-time armed line. For a player who does not
+    --                       want DR writing to their log at all.
+    --   Slow passes only -- the default. Silent unless a pass exceeds PASS_PROFILE_MS (150 ms), so a
+    --                       healthy farm logs one armed line per session and nothing further. This is
+    --                       what catches a problem nobody has reported yet.
+    --   Every pass       -- the diagnostic setting: two lines per in-game hour whatever the cost.
+    --                       This is what to ask a player for, because it produces numbers on a farm
+    --                       that is behaving as well as one that is not, and the two can be compared.
+    --
+    -- ANIMAL REDUX CARRIES THE SAME TOGGLE and the two are OR'd, not overridden -- see
+    -- SmartDistribution.passProfilerLevel. Either one asking for more logging wins, so a player can
+    -- turn it on from whichever settings page they happen to have open.
+    passProfiler = {
+        localOnly = true,
+        order   = 9.95,
+        default = 2,                                            -- Slow passes only (today's behaviour)
+        values  = { 0, 1, 2 },
+        strings = { "Off", "Slow passes only", "Every pass (diagnostic)" },
+    },
     debugEnabled = {
         order   = 10,
         default = 2,                                            -- Disabled
@@ -337,6 +365,11 @@ function DistributionSettings.apply()
     -- Clearing the adaptive backoff gives an explicit choice a fresh start rather than leaving it stretched
     -- by whatever the menu measured before -- the menu re-learns within a refresh or two if it needs to.
     g.menuRefresh      = DistributionSettings.menuRefresh
+    -- The profiler level is not read off S.global: it is OR'd with any other mod's request (Animal
+    -- Redux carries the same toggle), so it goes through the resolver rather than a plain field.
+    if SmartDistribution ~= nil and SmartDistribution.requestPassProfiler ~= nil then
+        SmartDistribution.requestPassProfiler("FS25_Distribution_Redux", DistributionSettings.passProfiler)
+    end
     if DistributionMenuPage ~= nil and DistributionMenuPage.resetRefreshPacing ~= nil then
         DistributionMenuPage.resetRefreshPacing()
     end
@@ -383,6 +416,7 @@ function DistributionSettings.saveLocal()
         return
     end
     setXMLFloat(xml, "distributionRedux.settings#menuRefresh", DistributionSettings.menuRefresh)
+    setXMLFloat(xml, "distributionRedux.settings#passProfiler", DistributionSettings.passProfiler)
     saveXMLFile(xml)
     delete(xml)
 end
@@ -572,6 +606,8 @@ local function readLocalSettings()
     -- absent in a settings file written before this option existed, so it simply keeps its default
     local refresh = getXMLFloat(xml, "distributionRedux.settings#menuRefresh")
     if refresh ~= nil and isAllowed("menuRefresh", refresh) then DistributionSettings.menuRefresh = refresh end
+    local prof = getXMLFloat(xml, "distributionRedux.settings#passProfiler")
+    if prof ~= nil and isAllowed("passProfiler", prof) then DistributionSettings.passProfiler = prof end
     delete(xml)
 end
 

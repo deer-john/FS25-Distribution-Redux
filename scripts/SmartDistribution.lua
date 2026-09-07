@@ -3503,6 +3503,9 @@ local function gatherSources(consumerPP, consumerPlaceable, ft, x, z, farmId)
     local ps = g_currentMission ~= nil and g_currentMission.placeableSystem or nil
     if ps == nil then return sources end
     local r2 = S.global.radius * S.global.radius
+    local sc = SmartDistribution._scan                    -- hourly-pass profiler (integer adds only)
+    sc.gather = sc.gather + 1
+    sc.placeables = sc.placeables + #ps.placeables
     for _, p in ipairs(ps.placeables) do
         if p ~= consumerPlaceable and p.rootNode ~= nil and canSourceDistribute(p, ft)
            and not SmartDistribution.isProductionInputOnly(p, ft) then
@@ -3523,11 +3526,21 @@ local function gatherSources(consumerPP, consumerPlaceable, ft, x, z, farmId)
                     -- the buffer -- see makeProductionSourceProxy for why the order matters and why
                     -- offering both separately left it arbitrary. With an empty pad this is the plain
                     -- storage exactly as before.
-                    local prodPad = pp2 ~= nil and isPalletSpawnerAsset(p)
+                    -- THE CHEAP GATE RUNS FIRST. This used to compute `prodPad` -- which reaches
+                    -- palletFillLevel and therefore a walk of the ENTIRE vehicle list -- BEFORE
+                    -- testing whether this building even outputs `ft`. Since prodPad is used only
+                    -- inside the branch below, every one of those scans on a non-matching product
+                    -- was pure waste: a bakery paid a full vehicle walk when asked about WHEAT,
+                    -- SILAGE, MILK and everything else any consumer happened to want.
+                    -- Measured on the real code (tools/hourlyperf.lua): this reorder plus the
+                    -- pass-scoped cache took a heavily-populated farm from 59.2M engine transform
+                    -- reads per pass to a few thousand. Semantically identical -- the same
+                    -- conditions in the same order, merely evaluated lazily.
+                    local prodOut = pp2 ~= nil and pp2 ~= consumerPP and pp2.storage ~= nil and
+                                    pp2.outputFillTypeIds ~= nil and pp2.outputFillTypeIds[ft]
+                    local prodPad = prodOut and isPalletSpawnerAsset(p)
                                     and (palletFillLevel(p, ft) or 0) > 0
-                    if pp2 ~= nil and pp2 ~= consumerPP and pp2.storage ~= nil and
-                       pp2.outputFillTypeIds ~= nil and pp2.outputFillTypeIds[ft] and
-                       (getLevel(pp2.storage, ft) > 0 or prodPad) then
+                    if prodOut and (getLevel(pp2.storage, ft) > 0 or prodPad) then
                         local st = prodPad and SmartDistribution.makeProductionSourceProxy(pp2, p)
                                             or pp2.storage
                         sources[#sources+1] = { storage = st, d2 = d2, placeable = p }
@@ -4045,12 +4058,29 @@ SmartDistribution._proportionalSplit = proportionalSplit   -- exposed for harnes
 -- quality DESC then distance ASC. `qmap` (ft->weight) only for husbandry food.
 local function buildSlotCandidates(consumerPP, placeable, fts, x, z, farmId, qmap)
     local out = {}
+    -- DEDUPE THE FILL TYPES FIRST. gatherSources is a FULL placeableSystem walk with an engine
+    -- transform per placeable, so a repeated ft is one of the most expensive things that can be
+    -- asked for twice -- and it buys nothing: the same ft yields the same sources, the same `q`
+    -- (qmap is keyed by ft), and candidates carrying an identical `key`, which allocate then merges
+    -- anyway. The only effect of the duplicates was wasted rounds -- slotBestCandidate blocking
+    -- index i and then retrying the identical storage at index j.
+    --
+    -- THE CALLER THAT ACTUALLY DOES THIS IS A FEED PLANNER (5.66), i.e. THIRD-PARTY CODE. Animal
+    -- Redux's SERIAL plan concatenates every food group's members, and each group's members already
+    -- carry every ration -- so TMR arrives once PER GROUP and a cow barn issued ~8 identical world
+    -- walks where 1-2 were needed. AR dedupes at source too, but this belongs here regardless: the
+    -- API contract treats a planner as untrusted and sanitises what it returns, and no planner
+    -- should be able to make DR walk the world an unbounded number of times by repeating itself.
+    local seenFt = {}
     for _, ft in ipairs(fts) do
+      if not seenFt[ft] then
+        seenFt[ft] = true
         local q = (qmap ~= nil and qmap[ft]) or 1.0
         for _, s in ipairs(gatherSources(consumerPP, placeable, ft, x, z, farmId)) do
             out[#out + 1] = { placeable = s.placeable, storage = s.storage, ft = ft, d2 = s.d2, q = q,
                               key = tostring(s.storage) .. "#" .. tostring(ft) }
         end
+      end
     end
     table.sort(out, function(a, b)
         if a.q ~= b.q then return a.q > b.q end       -- best feed quality first
@@ -4679,6 +4709,9 @@ local function gatherSinks(sourcePlaceable, ft, x, z, farmId, srcReach)
     local ps = g_currentMission ~= nil and g_currentMission.placeableSystem or nil
     if ps == nil then return sinks end
     local r2 = S.global.radius * S.global.radius
+    local sc = SmartDistribution._scan                    -- hourly-pass profiler
+    sc.sinks = sc.sinks + 1
+    sc.placeables = sc.placeables + #ps.placeables
     for _, p in ipairs(ps.placeables) do
         if p ~= sourcePlaceable and p.rootNode ~= nil then
             if SmartDistribution._farmCanUse(p, farmId) then
@@ -6350,7 +6383,58 @@ function SmartDistribution.palletOnSpawner(p, vx, vz)
     return false
 end
 
+-- ---- PASS-SCOPED PALLET SCAN CACHE -----------------------------------------------------------
+-- THE 2026-09-07 FREEZE FIX. Measured on the real code (tools/hourlyperf.lua, which loads this file
+-- under a mocked engine and runs the real runHourly): on a heavily populated pallet-heavy farm the
+-- pass issued 59,195,342 engine transform reads, of which 58,794,000 -- **99.3%** -- were this
+-- function walking the whole vehicle list, over and over, for the same buildings.
+--
+-- The nesting that produces it: gatherSources is called once per (consumer, fill type) and walks
+-- every placeable; for each pallet-spawner production it passes, it asks palletFillLevel, which
+-- lands here and walks every vehicle. So V is traversed A x F x P_spawner times per hour.
+--
+-- WHY THERE WAS NO CACHE ALREADY, and why this one is different. `padSnapshot` (below) memoises the
+-- same numbers but is guarded by `memoReadable()`, which is deliberately FALSE inside the pass --
+-- 5.46c's reasoning, and it is correct: during fast-forward many passes run inside ONE frame, so a
+-- getTimeSec-based TTL does not expire between them and a cached LEVEL could be eight hours stale.
+--
+-- This cache sidesteps that argument entirely rather than arguing with it, because it is not
+-- time-based: it is cleared at the top of every pass AND by every mutation, so it is EXACT rather
+-- than merely fresh. A cached entry can only ever be read within the same pass that built it, with
+-- no intervening pallet change.
+--
+-- IT CACHES OBJECT REFERENCES, which padSnapshot's header explicitly declines to do ("a stale object
+-- reference could be dereferenced after the engine deleted the pallet"). That warning is about a
+-- TTL cache living across frames, where the engine may delete a pallet at any time. Here the only
+-- thing that deletes a pallet mid-pass is DR itself, and every such site calls the invalidator --
+-- so the reference cannot outlive its object. The mutation sites are enumerated and few:
+-- drainPallets, _fillSpawnedPallet, _fillSpawnedPalletFromHusbandry, depositPalletsToShed,
+-- reclaimPartialPallets, sweepEmptyPadPallets, stagePalletsForShed.
+--
+-- COARSE INVALIDATION -- the whole store is dropped, never a single key. Mutations number a few
+-- dozen per pass against millions of reads, so the cost is nil, and it removes every question about
+-- key granularity (which building owned the deleted pallet? which fill types did it affect?).
+--
+-- PALLET_PASS_MEMO is the one-key off switch, the role _legacyInputMath plays for 5.46 and
+-- sdPalletHook for 5.39: if this ever misbehaves on a modded spawner, set it false and the function
+-- reverts to walking the vehicle list exactly as it always did.
+SmartDistribution.PALLET_PASS_MEMO = true
+SmartDistribution._palletScanMemo  = nil
+
+function SmartDistribution.invalidatePalletScan()
+    SmartDistribution._palletScanMemo = nil
+end
+
 local function husbandryPalletObjects(p, ft)
+    -- Readable ONLY inside the pass. Outside it there is no bracketing event to clear the cache, so
+    -- the menu keeps its existing behaviour (padSnapshot's TTL memo already serves that path).
+    local memo = nil
+    if SmartDistribution.PALLET_PASS_MEMO and (SmartDistribution._selfWrite or 0) > 0 then
+        memo = SmartDistribution._palletScanMemo
+        if memo == nil then memo = {}; SmartDistribution._palletScanMemo = memo end
+        local byFt = memo[p]
+        if byFt ~= nil and byFt[ft] ~= nil then return byFt[ft] end
+    end
     local out, seen = {}, {}
     local function consider(pallet)
         if type(pallet) ~= "table" or seen[pallet] then return end
@@ -6381,6 +6465,18 @@ local function husbandryPalletObjects(p, ft)
     end
     local vs = g_currentMission ~= nil and g_currentMission.vehicleSystem or nil
     if vs ~= nil and type(vs.vehicles) == "table" and p.rootNode ~= nil then
+        -- Hourly-pass profiler: THE nested term, and the one the model says dominates.
+        -- COUNTED ONLY INSIDE THE PASS. Unlike gatherSources/gatherSinks (whose only callers are
+        -- the slot collectors and the store phases), this function is also reached from the MENU
+        -- via assetHeld -> palletFillLevel on every GUI refresh. Those reads are real cost but they
+        -- are not THIS pass's, and folding them in would inflate the figure and misattribute the
+        -- menu's work to the allocator. `_selfWrite` is already the file's "am I mid-pass" flag
+        -- (5.8); compared NUMERICALLY, because it is a depth counter and 0 is truthy in Lua (5.46c).
+        if (SmartDistribution._selfWrite or 0) > 0 then
+            local sc = SmartDistribution._scan
+            sc.padScan = sc.padScan + 1
+            sc.vehicles = sc.vehicles + #vs.vehicles
+        end
         local hx, _, hz = getWorldTranslation(p.rootNode)
         local farmId = (p.getOwnerFarmId ~= nil and p:getOwnerFarmId()) or p.ownerFarmId
         local radius = (getProductionPoint(p) ~= nil) and PALLET_ASSOC_RADIUS_PROD or PALLET_ASSOC_RADIUS
@@ -6416,6 +6512,11 @@ local function husbandryPalletObjects(p, ft)
                 end
             end
         end
+    end
+    if memo ~= nil then
+        local byFt = memo[p]
+        if byFt == nil then byFt = {}; memo[p] = byFt end
+        byFt[ft] = out
     end
     return out
 end
@@ -6669,6 +6770,7 @@ function drainPallets(p, ft, amount, farmId)
     end
     for _, pallet in ipairs(toDelete) do
         if pallet.delete ~= nil then pcall(function() pallet:delete() end) end
+        SmartDistribution.invalidatePalletScan()   -- a pallet was created or destroyed: drop the pass cache
         if spec ~= nil and type(spec.pallets) == "table" then spec.pallets[pallet] = nil end
     end
     SmartDistribution.notePalletOut(p, ft, drained)   -- these litres came off the PAD, not the buffer
@@ -6907,6 +7009,7 @@ function drainShedStored(shed, ft, amount, farmId)
             if a.fillLevel <= 0.0001 then
                 table.remove(spec.storedObjects, i)
                 if type(obj) == "table" and obj.delete ~= nil then pcall(function() obj:delete() end) end
+                SmartDistribution.invalidatePalletScan()   -- a pallet was created or destroyed: drop the pass cache
             end
         end
     end
@@ -7594,6 +7697,7 @@ local function depositPalletsToShed(coop, ft, shed, maxSlots)
         if can then
             shed:addObjectToObjectStorage(e.pallet)   -- despawns the pallet + stores it abstractly
             if spec ~= nil and type(spec.pallets) == "table" then spec.pallets[e.pallet] = nil end  -- defensive (trigger also clears on delete)
+            SmartDistribution.invalidatePalletScan()   -- pallet despawned into the shed: membership changed
             moved = moved + e.lvl
             slotsUsed = slotsUsed + 1
         end
@@ -7871,6 +7975,155 @@ end
 -- and was documented as the largest single cost in the pass and the main cause of the on-the-hour and
 -- fast-forward stutter (5.38, 5.46a). It is simply gone now.
 
+-- ---- HOURLY PASS PROFILER ---------------------------------------------------------------------
+-- Reported 2026-09-07: a ~2 MINUTE freeze every in-game hour on heavily populated maps. A blocked
+-- frame produces NO error and NO log line -- 5.46's signature -- so there was nothing to read, and
+-- the cost had to be placed by modelling the nesting rather than by measuring it. This is what turns
+-- that model into a measurement, on the player's own save.
+--
+-- IT COUNTS SCANS, NOT ONLY TIME, and that is the whole design. A millisecond figure says the pass
+-- was slow; a scan count says WHY, and can be checked against a prediction. The model in
+-- tools/hourlycost.lua predicts the vehicle term dominates the placeable term by ~20x on a
+-- pallet-heavy farm -- these counters either show that or refute it, on the first slow hour.
+--
+-- SELF-REPORTING, so a player produces the diagnostic without being talked through enabling
+-- anything: a bare `print`, never log() (which is gated on `debug`). Same reason 5.52's
+-- "Overview open" line and 5.63's setting diagnostic are unconditional. Silent on a normal farm --
+-- nothing is emitted below PASS_PROFILE_MS.
+--
+-- THE COUNTERS COST AN INTEGER ADD against a getWorldTranslation, i.e. under a tenth of a percent
+-- of what they measure, so they are always on. A diagnostic that must be switched on produces no
+-- data from the people who have the problem.
+--
+-- FAST-FORWARD IS FLAGGED rather than suppressed. During sleep the pass runs SYNCHRONOUSLY, many
+-- times per frame (4.3), so a burst of lines IS the finding -- an 8-hour sleep paying 8 passes is
+-- how a 15 s hourly cost is experienced as a 2-minute freeze. Suppressing the repeats would hide
+-- exactly that.
+-- THRESHOLD, in ms. 0 = report EVERY pass -- which is what a diagnostic build wants; set it there
+-- temporarily to get a baseline out of a farm that is behaving.
+--
+-- 150 is the SHIPPING value and is deliberately not higher: after the 2026-09-07 fix a heavily
+-- populated farm should sit far below it, so anything that does report is either a farm shape we
+-- have not seen or a regression -- and in both cases the scan counts on the second line say which.
+--
+-- It shipped at 150 first and that was a mistake worth recording: the first run produced NOTHING,
+-- and three different causes produce exactly that silence -- the pass was fast, the pass never ran,
+-- or getTimeSec is unavailable and the whole profiler quietly disabled itself. A diagnostic whose
+-- failure modes are indistinguishable from its success mode cannot settle anything, which is the
+-- lesson 5.87c already paid for ("it reports itself, once per session, unconditionally, because
+-- this had been reported as 'still not fixed' twice with nothing in the log either way").
+SmartDistribution.PASS_PROFILE_MS = 150
+SmartDistribution._scan = { gather = 0, placeables = 0, sinks = 0, padScan = 0, vehicles = 0 }
+SmartDistribution._passProf = nil
+SmartDistribution._profArmed = false
+
+-- ---- WHO WANTS THE PROFILER ON -------------------------------------------------------------
+-- DR owns the hourly pass, so DR owns the profiler -- but the player may be looking at ANY mod's
+-- settings page when they are asked to turn logging on. So every interested mod registers a level
+-- here and the EFFECTIVE level is the HIGHEST anyone asked for: either one on means it runs.
+--
+-- MAX, NOT LAST-WRITER, and that is the whole point. Last-writer-wins would make the result depend
+-- on the order the two settings pages happened to apply, so a player could turn it on in Animal
+-- Redux and have DR silently switch it back off on the next settings sync -- which would look
+-- exactly like the feature not working.
+--
+--   0 = off (silent, including the armed line)   1 = slow passes only   2 = every pass
+--
+-- An UNREGISTERED mod contributes nothing rather than 0, so a mod that never calls this can never
+-- hold the level down; only an explicit request for 0 does, and it is still outvoted by any request
+-- for more. Levels are clamped, so a caller passing nonsense cannot disable the profiler or invent
+-- a state that does not exist.
+SmartDistribution._profRequests = {}
+
+function SmartDistribution.requestPassProfiler(modName, level)
+    if type(modName) ~= "string" then return end
+    local n = tonumber(level)
+    if n == nil then return end
+    n = math.max(0, math.min(2, math.floor(n)))
+    SmartDistribution._profRequests[modName] = n
+end
+
+function SmartDistribution.passProfilerLevel()
+    local best = nil
+    for _, v in pairs(SmartDistribution._profRequests) do
+        if best == nil or v > best then best = v end
+    end
+    -- Nobody has registered yet (settings not applied, or DR loaded alone with an older settings
+    -- file): fall back to the shipped default rather than to silence, so a farm with a problem still
+    -- reports it before anyone has touched a setting.
+    if best == nil then return 1 end
+    return best
+end
+
+function SmartDistribution.beginPassProfile()
+    local sc = SmartDistribution._scan
+    sc.gather, sc.placeables, sc.sinks, sc.padScan, sc.vehicles = 0, 0, 0, 0, 0
+    if getTimeSec == nil then SmartDistribution._passProf = nil; return end
+    local now = getTimeSec()
+    SmartDistribution._passProf = { t0 = now, last = now, marks = {}, order = {} }
+end
+
+-- Accumulates by NAME, so the same label may be marked more than once (the market phases are two
+-- calls that belong under one heading) without inventing a second row for it.
+function SmartDistribution.markPass(name)
+    local pr = SmartDistribution._passProf
+    if pr == nil then return end
+    local now = getTimeSec()
+    if pr.marks[name] == nil then pr.order[#pr.order + 1] = name; pr.marks[name] = 0 end
+    pr.marks[name] = pr.marks[name] + (now - pr.last) * 1000
+    pr.last = now
+end
+
+function SmartDistribution.reportPassProfile()
+    local pr = SmartDistribution._passProf
+    SmartDistribution._passProf = nil
+    -- OFF means completely silent -- no armed line either. A player who has turned this off has said
+    -- they do not want DR writing to their log, and half-honouring that would be worse than not
+    -- offering the setting. The counters still run: they are integer adds, and leaving them on means
+    -- switching the profiler back ON reports the very next pass rather than the one after it.
+    local level = SmartDistribution.passProfilerLevel()
+    if level <= 0 then return end
+    -- ONE-TIME ARM LINE, unconditional. This is what makes silence afterwards MEAN something: if
+    -- this line is absent the pass never completed at all, and if it says "no clock" the timings
+    -- are unavailable but the SCAN COUNTS below are still exact (they need no clock, and they are
+    -- the half that names the cause anyway).
+    if not SmartDistribution._profArmed then
+        SmartDistribution._profArmed = true
+        print(string.format(
+            "[SmartDistribution] hourly profiler armed: clock %s, mode %s, debug logging %s",
+            getTimeSec ~= nil and "OK" or "UNAVAILABLE (timings suppressed, scan counts still valid)",
+            level >= 2 and "EVERY PASS"
+                       or string.format("slow passes only (>%d ms)", SmartDistribution.PASS_PROFILE_MS or 150),
+            SmartDistribution.debug and "ON (inflates the pass -- turn it off to measure)" or "off"))
+    end
+    local total = nil
+    if pr ~= nil and getTimeSec ~= nil then total = (getTimeSec() - pr.t0) * 1000 end
+    -- Level 2 reports unconditionally -- that is the diagnostic setting, and its value is that it
+    -- produces numbers on a HEALTHY farm too, so a reported one has something to be compared against.
+    -- Level 1 reports only above the threshold. A MISSING clock always reports, because then there is
+    -- no measurement to compare against the threshold in the first place.
+    if level < 2 and total ~= nil and total < (SmartDistribution.PASS_PROFILE_MS or 150) then return end
+    pr = pr or { order = {}, marks = {} }
+    local parts = {}
+    for _, name in ipairs(pr.order) do
+        local ms = pr.marks[name] or 0
+        if ms >= 1 then parts[#parts + 1] = string.format("%s %.0f", name, ms) end
+    end
+    local sc = SmartDistribution._scan
+    print(string.format(
+        "[SmartDistribution] hourly pass %s%s | %s",
+        total ~= nil and string.format("%.0f ms", total) or "(no clock)",
+        SmartDistribution._fastForward and " (FAST-FORWARD)" or "",
+        #parts > 0 and table.concat(parts, ", ") or "no phase over 1 ms"))
+    -- The second line is the one that names the cause. `vehicles` is the nested term: if it dwarfs
+    -- `placeables`, the pallet scan is the fault (and the ratio vehicles/padScan is the pallet count
+    -- being re-walked). If they are comparable, the outer placeable walk is the fault instead.
+    print(string.format(
+        "[SmartDistribution]   scans: gatherSources %d (%d placeable visits), gatherSinks %d, "
+        .. "pallet scans %d (%d vehicle visits)",
+        sc.gather, sc.placeables, sc.sinks, sc.padScan, sc.vehicles))
+end
+
 function SmartDistribution.runHourly(manager)
     if not S.master then return end
     -- DEDICATED SERVER safety net: if the load hook deferred because the savegame path was not yet
@@ -7889,6 +8142,8 @@ function SmartDistribution.runHourly(manager)
             pcall(DistributionSettings.apply)                   -- push the recovered values into the engine
         end
     end
+    SmartDistribution.beginPassProfile()                       -- hourly-pass profiler: zero the clocks + scan counters
+    SmartDistribution.invalidatePalletScan()                   -- the pallet-scan cache is PASS-SCOPED: never carry one across
     SmartDistribution.invalidateMenuMemos()                    -- the display memos must not carry across a pass
     resetCycleMoney()                                         -- open this hour's money tally (flushed at the END of this tick, after the appended surplus-sell pass)
     -- (no enforceValidModes here any more -- a player's mode is never rewritten; see the note above it)
@@ -7901,6 +8156,7 @@ function SmartDistribution.runHourly(manager)
     SmartDistribution.sweepEmptyPadPallets()                   -- phase 0b: clear empty pallets left on a pen's OR production's pad
     SmartDistribution.spawnWholePallets()                     -- phase 0c: release FULL pallets from pen buffers (setting); before slots so they are sources this pass
     SmartDistribution.suppressPassThroughLines()              -- phase 0d: switch a pass-through store's scaffolding lines off (setting; no-op unless chosen)
+    SmartDistribution.markPass("observe/pallets")              -- profiler: phase 0 (observeHusbandryProduction + the pad sweeps)
     -- REVERTED 2026-08-17, and the reason is a rule this codebase already learned the hard way.
     --
     -- gateSharedTankProductions held a line OFF until its input had been routed. It does not work and it
@@ -7930,11 +8186,15 @@ function SmartDistribution.runHourly(manager)
     SmartDistribution.collectRobotFeedSlots(slots)             -- feeding-robot ingredient bunkers
     collectStrawSlots(slots)
     collectHusbandryWaterSlots(slots)
+    SmartDistribution.markPass("collect")                      -- profiler: slot collection (the gatherSources sweep)
     allocate(slots, bill)
+    SmartDistribution.markPass("allocate")
     storePhase(manager, bill)                                  -- phase 1d: push Distribute+Store remainders to storage
+    SmartDistribution.markPass("store")
     SmartDistribution.stagePalletsForShed(bill)                -- phase 1d2: spawning OFF -- internal stock -> pallet shed as whole pallets (all of it, one pad slot at a time)
     palletPhase(manager, bill)                                 -- phase 1e: pallet-spawner outputs (eggs/wool/honey)
     shedPhase(manager)                                         -- phase 1f: shed (object storage) SELL / DISTRIBUTE_SELL remainders
+    SmartDistribution.markPass("pallet/shed")
     chargeDistribution(bill)                                   -- phase 1.5: distance-based billing
     SmartDistribution.chargeProductionCosts(manager)           -- phase 1.5b: vanilla costsPerActiveHour, lost with the suppressed hourly pass
     if S.global.sellEnabled then                               -- phase 2
@@ -7947,6 +8207,7 @@ function SmartDistribution.runHourly(manager)
     -- a buffer for good (the divert had banked 20,000 of them and nothing could ever release it).
     -- Market Supply therefore keeps routing with selling off; it just sells on arrival.
     SmartDistribution.marketSellPhase(manager)                 -- phase 2d: markets sell their buffers (native price + 20% bonus)
+    SmartDistribution.markPass("sell/market")
     sellDirectProduction(manager)                              -- phase 2b: plant sellDirectly outputs (biogas electric/methane)
     -- phase 2e: sell the surplus of Distribute+Sell / Sell production OUTPUTS (incl. modded grid products like
     -- electricity) that phase 1 did not distribute. MUST run here, after distribute -- it used to be appended
@@ -7983,6 +8244,8 @@ function SmartDistribution.runHourly(manager)
     -- pass, so its sales fold into the same number. With the add-on absent, nothing sells after this
     -- point, so emit the summary here and now -- still the same tick the money was applied.
     SmartDistribution.flushCycleSummary()                         -- accumulate this cycle; the settled emit fires from the update frame
+    SmartDistribution.markPass("accounting")
+    SmartDistribution.reportPassProfile()                         -- silent unless this pass exceeded PASS_PROFILE_MS
 end
 
 -- Everything the hourly pass moves is DR's own doing and is already in the ledger, so the manual
@@ -8841,6 +9104,10 @@ end
 -- `limit` (optional) caps what goes into THIS pallet, so a chain spawning an exact litre amount ends
 -- with a partial pallet instead of a full one. nil = fill it.
 function SmartDistribution._fillSpawnedPallet(pp, ft, pallet, isNew, limit)
+    -- A pallet has just been created (or is about to be filled/removed): the pass cache holds
+    -- MEMBERSHIP, so any change to which pallets exist must drop it. Levels are read live off the
+    -- cached objects, so a partial DRAIN needs no invalidation -- only create/destroy does.
+    SmartDistribution.invalidatePalletScan()
     if pp == nil or ft == nil or type(pallet) ~= "table" or pallet.addFillUnitFillLevel == nil then return 0 end
     local farmId = (pp.getOwnerFarmId ~= nil and pp:getOwnerFarmId()) or 1
     local unit
@@ -8872,6 +9139,7 @@ function SmartDistribution._fillSpawnedPallet(pp, ft, pallet, isNew, limit)
         -- that too. Deleting on it would destroy real product. `isNew ~= false` so an older caller that
         -- passes nothing keeps the previous behaviour.
         if isNew ~= false and pallet.delete ~= nil then pcall(function() pallet:delete() end) end
+        SmartDistribution.invalidatePalletScan()   -- a pallet was created or destroyed: drop the pass cache
         return 0
     end
     if added > 0 and pp.storage ~= nil and pp.storage.setFillLevel ~= nil and pp.storage.getFillLevel ~= nil then
@@ -9118,6 +9386,10 @@ end
 -- NOTE it does not weaken the delete-on-empty guard below: that fires on `added <= 0` -- NOTHING went in
 -- -- which a partial fill never is. A partial pallet is a legitimate result; an empty one never is.
 function SmartDistribution._fillSpawnedPalletFromHusbandry(p, ft, pallet, isNew, limit)
+    -- A pallet has just been created (or is about to be filled/removed): the pass cache holds
+    -- MEMBERSHIP, so any change to which pallets exist must drop it. Levels are read live off the
+    -- cached objects, so a partial DRAIN needs no invalidation -- only create/destroy does.
+    SmartDistribution.invalidatePalletScan()
     local hs = p ~= nil and p.spec_husbandryPallets or nil
     if hs == nil or ft == nil or type(pallet) ~= "table" or pallet.addFillUnitFillLevel == nil then return 0 end
     if type(hs.pendingLiters) ~= "table" then return 0 end
@@ -9155,6 +9427,7 @@ function SmartDistribution._fillSpawnedPalletFromHusbandry(p, ft, pallet, isNew,
         -- rest arrive empty; those are deleted here. Wasted churn, but the litres are never lost (an unfilled
         -- pallet leaves pendingLiters untouched) and no junk pallet survives.
         if pallet.delete ~= nil then pcall(function() pallet:delete() end) end
+        SmartDistribution.invalidatePalletScan()   -- a pallet was created or destroyed: drop the pass cache
         if type(hs.pallets) == "table" then hs.pallets[pallet] = nil end
         return 0
     end
@@ -15766,6 +16039,7 @@ function SmartDistribution.reclaimPartialPallets(p, pp, ft, farmId)
     end
     for _, pallet in ipairs(toDelete) do
         if pallet.delete ~= nil then pcall(function() pallet:delete() end) end
+        SmartDistribution.invalidatePalletScan()   -- a pallet was created or destroyed: drop the pass cache
         local spec = p.spec_husbandryPallets
         if spec ~= nil and type(spec.pallets) == "table" then spec.pallets[pallet] = nil end
     end
@@ -16292,6 +16566,7 @@ function SmartDistribution.sweepEmptyPadPallets()
                     log("sweepEmptyPad %s: removing an empty pallet", placeableName(p))
                 end
                 if pallet.delete ~= nil then pcall(function() pallet:delete() end) end
+                SmartDistribution.invalidatePalletScan()   -- a pallet was created or destroyed: drop the pass cache
                 if hs ~= nil and type(hs.pallets) == "table" then hs.pallets[pallet] = nil end
             end
         end

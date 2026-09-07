@@ -422,15 +422,31 @@ function DistributionSettingsPage:onFrameOpen()
     if SmartDistribution ~= nil then SmartDistribution._settingsPage = self end
     ownTab()
     self:refreshPageTabs()
-    -- refreshPageTabs above already clamped whichever rows it made visible; this is
-    -- the belt for a page opened without a tab change ever happening.
-    self:clampVisibleTooltips()
-    if DistributionSettings == nil or DistributionSettings.getStateIndex == nil then return end
-    for id, element in pairs(self.settingElements) do
-        if element.setState ~= nil then
-            pcall(function() element:setState(DistributionSettings.getStateIndex(id)) end)
+    -- SEED DR'S OWN SELECTORS FIRST, THEN CLAMP. The order here was wrong and it is what made the
+    -- hints run off the page on DR's tab while Animal Redux's were fine -- which looked like the fix
+    -- having been applied to one mod and not the other, and is really one line in the wrong place.
+    --
+    -- setState re-lays the row, and updateAbsolutePosition then rebuilds absPosition from
+    -- `anchorDeltas` -- which are computed at LOAD and are not recomputed while that list is
+    -- non-empty (GuiElement.lua:1050). So a tooltip this function has already moved snaps straight
+    -- back to where the XML put it. The clamp reported success either way (36 moved, 0 stuck), because
+    -- the move genuinely did land -- and was then undone a few lines later.
+    --
+    -- IT ONLY EVER HIT DR'S OWN ROWS, and that asymmetry is the whole tell: this loop walks
+    -- `settingElements`, which is populated by onCreateSetting -- and the twelve EXTENSION rows
+    -- deliberately carry no onCreate (see the XML), so a provider's rows are not in it and were never
+    -- disturbed. Same page, same clamp, same code path; only DR's half was being un-fixed afterwards.
+    if DistributionSettings ~= nil and DistributionSettings.getStateIndex ~= nil then
+        for id, element in pairs(self.settingElements) do
+            if element.setState ~= nil then
+                pcall(function() element:setState(DistributionSettings.getStateIndex(id)) end)
+            end
         end
     end
+    -- LAST, unconditionally. The early `return` that used to sit above this loop meant a page opened
+    -- without DistributionSettings never reached anything after it either; there is nothing below
+    -- worth skipping, so the guard is now around the loop rather than around the rest of the function.
+    self:clampVisibleTooltips()
 end
 
 ---Re-seat every VISIBLE tooltip inside the list it is drawn in.
@@ -482,6 +498,10 @@ function DistributionSettingsPage:onOptionChanged(state, element)
     if DistributionControls ~= nil and DistributionControls.onMenuOptionChanged ~= nil then
         DistributionControls:onMenuOptionChanged(state, element)
     end
+    -- Moving a selector changes its displayed text, which can re-lay that row and revert its tooltip.
+    -- Cheap and idempotent (after a successful clamp the next pass computes no overrun), so it is run
+    -- rather than reasoned about -- the reasoning is what got the order wrong in onFrameOpen.
+    self:clampVisibleTooltips()
 end
 
 ---Redraw the extension rows of whichever settings page is open. Safe to call at
@@ -497,5 +517,10 @@ function SmartDistribution.refreshSettingsRows()
     local page = SmartDistribution._settingsPage
     if page == nil or page.renderExtRows == nil or page.activeExtRows == nil then return false end
     local ok = pcall(function() page:renderExtRows(page:activeExtRows()) end)
+    -- renderExtRows calls setState on every row it fills, which relays them and reverts any tooltip
+    -- the clamp had moved -- the same mechanism that was undoing DR's own rows in onFrameOpen. This
+    -- is the ASYNC path (a provider whose setter answers via a confirmation dialog), so without this
+    -- a hint could be correct on open and wrong again after the player answered a prompt.
+    if page.clampVisibleTooltips ~= nil then pcall(page.clampVisibleTooltips, page) end
     return ok
 end
