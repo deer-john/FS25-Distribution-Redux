@@ -123,6 +123,8 @@
         <text name="dr_status_short_blocked" text="Zablok." />
         <text name="dr_status_short_none" text="-" />
         <text name="dr_col_productionLines"   text="LINIE PRODUKCYJNE" />
+        <text name="dr_col_lineInput"      text="WEJŚCIE" />
+        <text name="dr_col_lineOutput"     text="WYJŚCIE" />
         <!-- "/mo" = miesiecznie. Wartosc to miesieczny cel danej linii. -->
         <text name="dr_col_targetMo"          text="CEL /mies" />
 

@@ -3,7 +3,7 @@
      loads; 110 matches the current patch and silences the version notice. -->
 <modDesc descVersion="111">
     <author>Bones</author>
-    <version>1.1.0.2</version>
+    <version>1.1.0.3</version>
 
     <title>
         <en>Distribution Redux</en>
@@ -224,6 +224,7 @@ v1.0.0.1
         <!-- Seasonal price-curve reader for best-price selling (pure reader; loaded early). -->
         <sourceFile filename="scripts/DistributionPricing.lua"/>
         <sourceFile filename="scripts/SmartDistribution.lua"/>
+        <sourceFile filename="scripts/DistributionSort.lua"/>
         <!-- The public extension API. MUST load after SmartDistribution.lua: it adds
              fields to that table, and bails with a log line if it loads first. -->
         <sourceFile filename="scripts/DistributionAPI.lua"/>

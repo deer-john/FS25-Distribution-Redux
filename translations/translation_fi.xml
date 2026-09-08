@@ -80,6 +80,8 @@
         <text name="dr_col_outputMode"        text="LÄHTÖTAPA" />
         <text name="dr_col_status"            text="TILA" />
         <text name="dr_col_productionLines"   text="TUOTANTOLINJAT" />
+        <text name="dr_col_lineInput"      text="SYÖTE" />
+        <text name="dr_col_lineOutput"     text="TUOTOS" />
         <text name="dr_col_targetMo"          text="TAVOITE /kk" />
 
         <!-- ================= Advanced Outputs dialog ================= -->

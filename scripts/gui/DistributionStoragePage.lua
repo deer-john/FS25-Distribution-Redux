@@ -249,6 +249,10 @@ local function buildProductRows(asset, ordered, role)
         ordered, hidden = SmartDistribution.visibleProducts(asset, ordered, role)
     end
     for _, ft in ipairs(ordered) do rows[#rows + 1] = { ft = ft, name = fillTypeTitle(ft) } end
+    -- DISPLAY ORDER ONLY: alphabetical by the product title in the player's own language, with the
+    -- fillType index as the stable second key (see DistributionSort). Sorted BEFORE the notice row is
+    -- appended, so "+N blocked" always stays last. Nothing about stock, capacity, modes or routing moves.
+    if DistributionSort ~= nil then DistributionSort.sort(rows) end
     if hidden > 0 then rows[#rows + 1] = { notice = hidden } end
     return rows
 end
@@ -576,6 +580,14 @@ function DistributionStoragePage:rebuildAssets()
         if allow[a.class] then
             self.assets[#self.assets + 1] = a
         end
+    end
+    -- Alphabetical by the building name the player SEES (renamed name included), tie-broken by roleUid so
+    -- two identically named buildings never swap between rebuilds. self.assets is this page's own display
+    -- copy -- the enumerator's list, the savegame order and the placeable system are untouched.
+    if DistributionSort ~= nil then
+        DistributionSort.sort(self.assets,
+            function(a) return a.name or a.baseName or a.origName end,
+            function(a) return a.roleUid end)
     end
 end
 
@@ -1181,7 +1193,8 @@ function DistributionAnimalHusbandryPage:buildDetailRows()
     if SmartDistribution.husbandryInputFillTypes ~= nil then
         local ins = {}
         for ft in pairs(SmartDistribution.husbandryInputFillTypes(asset)) do ins[#ins + 1] = ft end
-        table.sort(ins)
+        table.sort(ins)   -- deterministic base order; buildProductRows applies the localized order
+
         self.inputRows = buildProductRows(asset, ins, self.selectedRole)
     end
     if SmartDistribution.husbandryOutputSet ~= nil then

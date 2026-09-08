@@ -240,15 +240,54 @@ function DistributionSettingsPage:activeExtRows()
     return (ok and type(rows) == "table") and rows or {}
 end
 
+---Give the rows back the strip's space when there is no strip.
+--
+-- The 46px is reserved by the LAYOUT PROFILE (SDSettingsLayoutTabbed shrinks the
+-- ScrollingLayout from the top), so suppressing the buttons alone leaves a gap
+-- where the strip would have been.
+--
+-- applyProfile RE-READS absoluteSizeOffset and the pivot from the new profile
+-- (GuiElement.lua:322), and fs25_settingsLayout declares an absoluteSizeOffset of
+-- its own ("90px 0px"), so the swap RESETS the 46px rather than inheriting it --
+-- loadProfile keeps the CURRENT value only for a key the new profile omits, which
+-- is the trap to check before reusing this on another element. `with=` traits are
+-- baked into the profile's values at load (GuiProfile.lua:57), so the pivot comes
+-- across too.
+--
+-- THEN setSize(), AND IT IS NOT OPTIONAL: updateAbsolutePosition recomputes
+-- anchorDeltas only when that list is EMPTY (GuiElement.lua:1050), so on an
+-- element the layout has already placed it rebuilds from the STALE deltas and the
+-- size just resolved is ignored. setSize calls updateAnchorDeltas first (:1179),
+-- which is the supported way to resize something already on screen. This is
+-- 5.87c's trap one function over, where the symptom was a fix that silently did
+-- nothing. No arguments: setSize defaults to the element's own size, so this
+-- re-applies what applyProfile just computed rather than naming a number here.
+--
+-- Children are left to the BoxLayout re-flow that follows in refreshPageTabs
+-- (updateChildAnchorDeltas defaults to false), which is what places the rows.
+function DistributionSettingsPage:applyStripSpace(hasStrip)
+    local el = self.boxLayout
+    if el == nil or el.applyProfile == nil then return end
+    local want = hasStrip and "SDSettingsLayoutTabbed" or "fs25_settingsLayout"
+    if el.profile == want then return end
+    pcall(el.applyProfile, el, want, false, true)
+    if el.setSize ~= nil then pcall(el.setSize, el) end
+end
+
+
 ---Paint the strip from the registry, then show whichever set of rows belongs to
 -- the active tab.
 function DistributionSettingsPage:refreshPageTabs()
     local list, labels = tabList(), {}
     for i, t in ipairs(list) do labels[i] = t.label end
     if self.currentTab == nil or self.currentTab > #list then self.currentTab = 1 end
+    local shown = 0
     if SmartDistribution ~= nil and SmartDistribution.drawPageTabs ~= nil then
-        SmartDistribution.drawPageTabs(self, labels, self.currentTab)
+        shown = SmartDistribution.drawPageTabs(self, labels, self.currentTab) or 0
     end
+    -- BEFORE the row work below, so the invalidateLayout at the end of this
+    -- function re-flows the rows into whatever height the layout now has.
+    self:applyStripSpace(shown > 0)
 
     -- DR's own rows are visible only on DR's own tab, and a foreign tab's rows
     -- only on its own. Both sets live in the SAME ScrollingLayout so that one

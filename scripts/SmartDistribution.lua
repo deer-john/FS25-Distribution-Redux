@@ -14908,7 +14908,15 @@ function SmartDistribution.receiverInputRows(p, role)   -- role-scoped: see stor
     table.sort(rows, function(a, b)
         if (a.readOnly or false) ~= (b.readOnly or false) then return not a.readOnly end   -- read-only rows last
         if a.pooled ~= b.pooled then return a.pooled end   -- then pooled products first
-        return tostring(a.name) < tostring(b.name)
+        -- ON THE TITLE THE PLAYER SEES, and localised. `name` here is the internal fill-type name
+        -- ("MILK_BOTTLED") which the dialog re-resolves for display, so ordering by it sorted the
+        -- list by a string that appears nowhere on screen; tostring() on it is also a byte compare,
+        -- which puts an accented title outside the alphabet being read.
+        local ta, tb = SmartDistribution._ftTitle(a.ft), SmartDistribution._ftTitle(b.ft)
+        if DistributionSort ~= nil and DistributionSort.less ~= nil then
+            return DistributionSort.less(ta, a.ft, tb, b.ft)
+        end
+        return tostring(ta) < tostring(tb)
     end)
     return rows, (pool ~= nil and pool.liters or nil)
 end
@@ -18820,6 +18828,13 @@ end
 -- than repositioned (5.37).
 SmartDistribution.PAGE_TAB_MAX = 4
 
+---How many tabs must be registered before the strip is drawn at all. A strip of
+-- ONE is a control that cannot do anything: DR always registers its own tab, so
+-- on a stock install every page would carry a lone [DISTRIBUTION] button with
+-- nothing to switch to. Below this the whole strip is suppressed and the page
+-- reclaims the space (the settings layout does; the help page never gave any up).
+SmartDistribution.PAGE_TAB_MIN = 2
+
 ---Registered tabs, per page key ("settings" / "help"). DR's own tab is always
 -- first and is registered by the page itself, so a page always has at least one.
 SmartDistribution._pageTabs = SmartDistribution._pageTabs or {}
@@ -18887,16 +18902,30 @@ end
 ---Returns how many tabs are showing.
 function SmartDistribution.drawPageTabs(owner, labels, active)
     if owner == nil or type(labels) ~= "table" then return 0 end
+
+    -- COUNTED, not `#labels`: the paint loop below reads labels[i] directly, so a
+    -- hole in the array must not make the strip disappear. Counting the same way
+    -- the loop reads keeps the two in step.
+    local count = 0
+    for i = 1, SmartDistribution.PAGE_TAB_MAX do
+        if labels[i] ~= nil then count = count + 1 end
+    end
+    -- ONE TAB IS NOT A CHOICE. Suppressed rather than drawn, so the page can
+    -- reclaim the space it was reserving for the strip.
+    local strip = (count >= SmartDistribution.PAGE_TAB_MIN)
+
     local shown = 0
     for i = 1, SmartDistribution.PAGE_TAB_MAX do
         local btn   = owner["drTabBtn" .. i]
         local bg    = owner["drTabBg" .. i]
         local label = labels[i]
+        -- A tab is in use only if it has a label AND the strip is showing at all.
+        local use   = (label ~= nil) and strip
         -- A tab is ONLY selected if it is both the active one AND actually in use.
-        local live  = (i == active and label ~= nil)
+        local live  = (i == active) and use
 
-        if btn ~= nil and btn.setVisible ~= nil then btn:setVisible(label ~= nil) end
-        if bg ~= nil and bg.setVisible ~= nil then bg:setVisible(label ~= nil) end
+        if btn ~= nil and btn.setVisible ~= nil then btn:setVisible(use) end
+        if bg ~= nil and bg.setVisible ~= nil then bg:setVisible(use) end
         -- BOTH DESELECT OUTSIDE THE LABEL GUARD. Selecting the button inside it
         -- leaves a tab whose label went away still wearing textSelectedColor with
         -- no background under it -- the bug AR's harness caught on this widget.
@@ -18906,7 +18935,7 @@ function SmartDistribution.drawPageTabs(owner, labels, active)
         -- Nil guarded on the ELEMENT, not only the label: a page asking for more
         -- labels than its layout declares slots must not throw inside a populate,
         -- which aborts the render and shows as an empty page (5.44 / 5.57).
-        if label ~= nil and btn ~= nil then
+        if use and btn ~= nil then
             shown = shown + 1
             if btn.setText ~= nil then btn:setText(tostring(label)) end
         end

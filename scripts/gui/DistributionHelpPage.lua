@@ -219,6 +219,13 @@ function DistributionHelpPage:populateCellForItemInSection(list, section, index,
 end
 
 ---Paint the strip from the registry.
+--
+-- NOTHING TO RECLAIM WHEN THE STRIP IS SUPPRESSED, unlike the settings page: the
+-- strip was dropped into whitespace this layout already had between the header
+-- and the lists (commit f289044 added the block and moved no content), so hiding
+-- the buttons simply returns that whitespace. The container itself paints nothing
+-- either -- SDList extends emptyPanel, which is noSlice and transparent in every
+-- state -- so there is no bar left behind.
 function DistributionHelpPage:refreshPageTabs()
     local list, labels = tabList(), {}
     for i, t in ipairs(list) do labels[i] = t.label end

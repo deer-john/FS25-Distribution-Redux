@@ -309,7 +309,13 @@ function DistributionOverviewPage:buildFilterValues(all)
             local k = self:filterKeyOf(r)
             if k ~= nil and not seen[k] then seen[k] = true; values[#values + 1] = k end
         end
-        table.sort(values)
+        -- LOCALISED, not a byte compare: table.sort on strings orders by byte, which puts an
+        -- accented or non-Latin building or product name outside the alphabet the player reads in.
+        if DistributionSort ~= nil and DistributionSort.sortStrings ~= nil then
+            DistributionSort.sortStrings(values)
+        else
+            table.sort(values)
+        end
     end
     return values, seen
 end

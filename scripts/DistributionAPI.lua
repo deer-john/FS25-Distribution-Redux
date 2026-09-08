@@ -68,7 +68,7 @@ if SmartDistribution == nil then
 end
 
 SmartDistribution.API = SmartDistribution.API or {}
-SmartDistribution.API.VERSION = 9
+SmartDistribution.API.VERSION = 10
 
 -- name -> { fn = function, strikes = n }. Kept as an ARRAY too, so call order is
 -- registration order and therefore predictable rather than pairs()-random.
@@ -559,7 +559,7 @@ end
 -- controller -- a mismatch that works for XML-declared pages and not for one
 -- added at runtime.
 function SmartDistribution.API.addMenuPage(menu, page, position, sliceId, title, predicate,
-                                           buttons, badgeSliceId)
+                                           buttons, badgeSliceId, iconFilename)
     if menu == nil or page == nil then return false end
     if menu.pagingElement == nil or menu.registerPage == nil then
         log("addMenuPage: this menu has no paging element")
@@ -605,6 +605,21 @@ function SmartDistribution.API.addMenuPage(menu, page, position, sliceId, title,
 
         menu:addPageTab(page, nil, nil, sliceId)
         undo[#undo + 1] = function() menu.pageTabs[page] = nil end
+
+        -- REMEMBERED so a recycled cell can be put back the way it was. The tab populate needs
+        -- the slice to restore, and this is the only place that knows it.
+        menu._tabIconSlices = menu._tabIconSlices or {}
+        menu._tabIconSlices[page] = sliceId
+        undo[#undo + 1] = function() menu._tabIconSlices[page] = nil end
+
+        -- A PICTURE OF ITS OWN, instead of a base-game atlas slice. Optional and additive: omit
+        -- it and the tab is exactly as it was. White line art on transparency -- the profile
+        -- tints it, so a picture with a background renders as a tile. It SUPERSEDES badgeSliceId,
+        -- which is what lets a caller pass both and let an older menu fall back on its own.
+        if iconFilename ~= nil and menu.setPageTabIcon ~= nil then
+            menu:setPageTabIcon(page, iconFilename)
+            undo[#undo + 1] = function() menu:setPageTabIcon(page, nil) end
+        end
 
         -- A SECOND SLICE IN THE CORNER OF THE SAME TAB, for a page that is about
         -- two things at once. Optional and additive: omit it and the tab is

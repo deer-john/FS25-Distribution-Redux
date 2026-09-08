@@ -92,6 +92,8 @@
         <text name="dr_status_short_blocked" text="Blockiert" />
         <text name="dr_status_short_none" text="-" />
         <text name="dr_col_productionLines"   text="PRODUKTIONSLINIEN" />
+        <text name="dr_col_lineInput"      text="EINGANG" />
+        <text name="dr_col_lineOutput"     text="AUSGANG" />
         <!-- "/mo" = pro Monat. Der Wert ist das monatliche Ziel der Linie. -->
         <text name="dr_col_targetMo"          text="ZIEL /Mon" />
 

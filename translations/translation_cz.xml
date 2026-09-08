@@ -126,6 +126,8 @@
         <text name="dr_status_short_blocked" text="Blokov." />
         <text name="dr_status_short_none" text="-" />
         <text name="dr_col_productionLines" text="VÝROBNÍ LINKY" />
+        <text name="dr_col_lineInput"      text="VSTUP" />
+        <text name="dr_col_lineOutput"     text="VÝSTUP" />
         <!-- "/mo" = za měsíc. Hodnota je měsíční cíl linky. -->
         <text name="dr_col_targetMo" text="CÍL /měs" />
 

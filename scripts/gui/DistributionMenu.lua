@@ -279,12 +279,76 @@ function DistributionMenu:populateCellForItemInSection(list, section, index, cel
     -- row index selects the page directly.
     local page = (self.enabledPages or {})[index]
     local slice = page ~= nil and (self._tabBadges or {})[page] or nil
+    -- A CUSTOM ICON SUPERSEDES THE BADGE. The badge exists for a page that is about two things
+    -- and has only one stock slice to say so; a picture drawn for the page says both by itself,
+    -- and wearing a corner badge as well would be saying it twice. This also lets a caller pass
+    -- both unconditionally: an older menu with no icon support falls back to slice-plus-badge
+    -- with no version test anywhere.
+    local iconFile = page ~= nil and (self._tabIconFiles or {})[page] or nil
+    if iconFile ~= nil then slice = nil end
     if slice ~= nil and badge.setImageSlice ~= nil then
         pcall(badge.setImageSlice, badge, nil, slice)
         badge:setVisible(true)
     else
         badge:setVisible(false)
     end
+
+    -- ---- the tab's own icon ------------------------------------------------------------------
+    -- BOTH BRANCHES ARE EXPLICIT, and that is deliberate. Cells are RECYCLED, so a file left on a
+    -- cell would follow whichever tab reuses it -- and restoring the stock look is not "clear it",
+    -- it is re-applying the slice the page was registered with. Whether the super call above
+    -- re-applies it cannot be read (populateCellForItemInSection is stripped from the shipped
+    -- source, 5.86), so this does not depend on it either way.
+    local btn = nil
+    if cell.getDescendantByName ~= nil then
+        local ok, el = pcall(cell.getDescendantByName, cell, "tabButton")
+        if ok then btn = el end
+    end
+    if btn ~= nil then
+        if iconFile ~= nil and btn.setImageFilename ~= nil then
+            pcall(btn.setImageFilename, btn, nil, iconFile)
+            -- THE UVs MUST BE RESET TO THE WHOLE TEXTURE, and this was the whole bug: the
+            -- button's icon overlay still carries the UV window of the ATLAS SLICE it was
+            -- registered with, and setImageFilename does not touch it. createOverlay only swaps
+            -- the image handle, deleteOverlay never looks at uvs, and loadOverlay sets
+            -- DEFAULT_UVS only when uvs is nil. So a standalone picture was sampled through a
+            -- small sub-rectangle of the atlas and stretched across the tab -- which renders as a
+            -- washed out smear rather than as nothing, and THAT is the tell that the file was
+            -- loading correctly all along.
+            -- The base game states this exact case at MapOverlayGenerator.lua:602: "default crop
+            -- type icons are separate files, use full texture".
+            -- CLONED, never assigned by reference: DEFAULT_UVS is a shared global and Overlay.lua
+            -- clones it for that reason. No literal fallback either -- its assignment is in the
+            -- stripped part of the source, so a guessed UV set would fail looking exactly like the
+            -- bug being fixed.
+            if btn.setImageUVs ~= nil and Overlay ~= nil and Overlay.DEFAULT_UVS ~= nil then
+                local uvs = (table.clone ~= nil) and table.clone(Overlay.DEFAULT_UVS)
+                            or Overlay.DEFAULT_UVS
+                pcall(btn.setImageUVs, btn, nil, uvs)
+            end
+        else
+            local base = page ~= nil and (self._tabIconSlices or {})[page] or nil
+            if base ~= nil and btn.setImageSlice ~= nil then
+                pcall(btn.setImageSlice, btn, nil, base)
+            end
+        end
+    end
+end
+
+---Give a page its own icon FILE instead of an atlas slice, or clear it with nil.
+--
+-- WHY A FILE AT ALL: a tab icon is normally `iconSliceId` on the button, and the atlas lives in
+-- dataS.gar, so a mod cannot add a slice to it. The runtime setter is the only way in -- an
+-- `imageFilename` attribute in a layout cannot name a file a mod ships either (5.80).
+--
+-- The picture must be WHITE LINE ART ON TRANSPARENCY, because the profile tints it: the tab
+-- carries three different icon colours for normal, focused and selected. A picture with a solid
+-- background renders as a tile, not an icon.
+function DistributionMenu:setPageTabIcon(page, filename)
+    if page == nil then return end
+    self._tabIconFiles = self._tabIconFiles or {}
+    self._tabIconFiles[page] = filename
+    if self.rebuildTabList ~= nil then pcall(self.rebuildTabList, self) end
 end
 
 ---Give a page a corner badge, or clear it with nil. Applied on the next tab

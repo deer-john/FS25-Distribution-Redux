@@ -121,7 +121,9 @@
         <text name="dr_status_short_idle"     text="空闲" />
         <text name="dr_status_short_blocked"  text="已阻" />
         <text name="dr_status_short_none"     text="-" />
-        <text name="dr_col_productionLines"   text="生产线" />
+        <text name="dr_col_productionLines"   text="生产线" />
+        <text name="dr_col_lineInput"      text="输入" />
+        <text name="dr_col_lineOutput"     text="产出" />
         <!-- "/mo" = per month. The figure is the line's monthly target. -->
         <text name="dr_col_targetMo"          text="目标/月" />
 
