@@ -6938,10 +6938,52 @@ end
 -- players. The base game keeps spec.objectInfos (objects grouped per type) in sync for the HUD, so
 -- prefer that; fall back to the flat list on the server. Server totals are unchanged because
 -- objectInfos is rebuilt from storedObjects and carries the same objects.
+-- ---- PASS-SCOPED SHED READ CACHE ------------------------------------------------------------
+-- THE 2026-09-08 SECOND TERM. Measured on the real code (tools/hourlyperf.lua, whose world builders
+-- had NO object storage at all until this was chased -- which is why 5.89 measured clean and the
+-- freeze survived it): a farm with four sheds holding 800 objects each issued 969,600 reads of those
+-- objects in ONE pass, i.e. 303 reads of every stored object, and the count doubles independently
+-- with stored objects, with shed count, AND with the size of the rest of the world. Growing on two
+-- axes at once is 5.52's shape.
+--
+-- The cause is directly below: this function rebuilds a fresh table of EVERY object in the shed on
+-- every call, and shedStoredLiters calls it once per fill type.
+--
+-- SAME CONTRACT AS invalidatePalletScan, deliberately, so the two read as one idea: cleared at the
+-- top of every pass AND by every membership change, so it is EXACT rather than merely fresh, and an
+-- entry can only ever be read inside the pass that built it. It caches MEMBERSHIP -- the attrs
+-- tables it holds are the objects' own, which drainShedStored mutates IN PLACE, so a partial drain
+-- needs no invalidation and levels are never stale. Only add/remove does, and those sites are few
+-- and enumerated: drainShedStored, transferShedPallets, depositPalletsToShed, createStoredPallet,
+-- repairSheds.
+--
+-- NO CALLER MUTATES THE RETURNED LIST (checked: all six iterate it and nothing else), which is what
+-- makes handing the same table to each of them safe.
+--
+-- SHED_PASS_MEMO is the one-key off switch, the role PALLET_PASS_MEMO plays for 5.89.
+SmartDistribution.SHED_PASS_MEMO = true
+SmartDistribution._shedAttrMemo  = nil
+
+function SmartDistribution.invalidateShedScan()
+    SmartDistribution._shedAttrMemo = nil
+end
+
 local function shedStoredAttrs(shed)
     local spec = shed ~= nil and shed.spec_objectStorage or nil
     local out = {}
     if spec == nil then return out end
+    -- Readable ONLY inside the pass, for 5.46c's reason: outside it there is no bracketing event to
+    -- clear the cache, so the menu keeps exactly its existing behaviour.
+    local memo = nil
+    if SmartDistribution.SHED_PASS_MEMO and (SmartDistribution._selfWrite or 0) > 0 then
+        memo = SmartDistribution._shedAttrMemo
+        if memo == nil then memo = setmetatable({}, { __mode = "k" }); SmartDistribution._shedAttrMemo = memo end
+        local hit = memo[shed]
+        if hit ~= nil then return hit end
+        local sc = SmartDistribution._scan
+        sc.shedScan = sc.shedScan + 1
+        sc.shedRead = sc.shedRead + ((type(spec.storedObjects) == "table" and #spec.storedObjects) or 0)
+    end
     if type(spec.objectInfos) == "table" then
         for _, info in pairs(spec.objectInfos) do
             if type(info) == "table" then
@@ -6956,13 +6998,21 @@ local function shedStoredAttrs(shed)
             end
         end
     end
-    if #out > 0 then return out end
+    -- CACHE ON THIS PATH TOO. This early return is the normal, taken branch (objectInfos resolves on
+    -- both server and client), so storing the entry only at the tail below cached nothing whatsoever --
+    -- an early return above the new line, which is the 5.43 / 5.81 shape and was caught by a harness
+    -- that measured the read count rather than by reading the diff.
+    if #out > 0 then
+        if memo ~= nil then memo[shed] = out end
+        return out
+    end
     if type(spec.storedObjects) == "table" then
         for _, obj in ipairs(spec.storedObjects) do
             local a = storedObjectAttrs(obj)
             if a ~= nil then out[#out + 1] = a end
         end
     end
+    if memo ~= nil then memo[shed] = out end
     return out
 end
 
@@ -7015,6 +7065,7 @@ function drainShedStored(shed, ft, amount, farmId)
     end
     if drained > 0 then
         spec.numStoredObjects = #spec.storedObjects
+        SmartDistribution.invalidateShedScan()   -- membership and/or levels changed: drop the pass cache
         if shed.setObjectStorageObjectInfosDirty ~= nil then shed:setObjectStorageObjectInfosDirty() end
     end
     return drained
@@ -7204,6 +7255,7 @@ local function transferShedPallets(src, dst, ft, maxSlots)
         if a ~= nil and a.fillType == ft and (a.fillLevel or 0) > 0 then
             table.remove(ss.storedObjects, i)
             ds.storedObjects[#ds.storedObjects + 1] = obj
+            SmartDistribution.invalidateShedScan()   -- both sheds changed membership
             moved = moved + 1
         end
     end
@@ -7696,6 +7748,7 @@ local function depositPalletsToShed(coop, ft, shed, maxSlots)
         if shed.getObjectStorageCanStoreObject ~= nil then can = shed:getObjectStorageCanStoreObject(e.pallet) end
         if can then
             shed:addObjectToObjectStorage(e.pallet)   -- despawns the pallet + stores it abstractly
+            SmartDistribution.invalidateShedScan()   -- the shed gained an object
             if spec ~= nil and type(spec.pallets) == "table" then spec.pallets[e.pallet] = nil end  -- defensive (trigger also clears on delete)
             SmartDistribution.invalidatePalletScan()   -- pallet despawned into the shed: membership changed
             moved = moved + e.lvl
@@ -8013,7 +8066,8 @@ end
 -- lesson 5.87c already paid for ("it reports itself, once per session, unconditionally, because
 -- this had been reported as 'still not fixed' twice with nothing in the log either way").
 SmartDistribution.PASS_PROFILE_MS = 150
-SmartDistribution._scan = { gather = 0, placeables = 0, sinks = 0, padScan = 0, vehicles = 0 }
+SmartDistribution._scan = { gather = 0, placeables = 0, sinks = 0, padScan = 0, vehicles = 0,
+                            shedScan = 0, shedRead = 0, matCalls = 0, matBuilt = 0, matMs = 0 }
 SmartDistribution._passProf = nil
 SmartDistribution._profArmed = false
 
@@ -8058,6 +8112,7 @@ end
 function SmartDistribution.beginPassProfile()
     local sc = SmartDistribution._scan
     sc.gather, sc.placeables, sc.sinks, sc.padScan, sc.vehicles = 0, 0, 0, 0, 0
+    sc.shedScan, sc.shedRead, sc.matCalls, sc.matBuilt, sc.matMs = 0, 0, 0, 0, 0
     if getTimeSec == nil then SmartDistribution._passProf = nil; return end
     local now = getTimeSec()
     SmartDistribution._passProf = { t0 = now, last = now, marks = {}, order = {} }
@@ -8122,6 +8177,18 @@ function SmartDistribution.reportPassProfile()
         "[SmartDistribution]   scans: gatherSources %d (%d placeable visits), gatherSinks %d, "
         .. "pallet scans %d (%d vehicle visits)",
         sc.gather, sc.placeables, sc.sinks, sc.padScan, sc.vehicles))
+    -- THE STORE LINE, and it exists because the 2026-09-08 report put 97.7% of an 87.6 s pass in
+    -- storePhase while the two lines above accounted for none of it -- neither counter can see a
+    -- shed's stored objects or a materialised pallet, so the phase that WAS the freeze reported
+    -- nothing about itself. Printed only when there is something to report, so an ordinary farm
+    -- (no pallet sheds, or nothing routed into one) gains no line at all.
+    if sc.shedRead > 0 or sc.matCalls > 0 then
+        print(string.format(
+            "[SmartDistribution]   store: shed reads %d over %d scans | materialise %d call(s), "
+            .. "%d pallet(s) built%s",
+            sc.shedRead, sc.shedScan, sc.matCalls, sc.matBuilt,
+            (getTimeSec ~= nil) and string.format(", %.0f ms", sc.matMs) or ""))
+    end
 end
 
 function SmartDistribution.runHourly(manager)
@@ -8144,6 +8211,8 @@ function SmartDistribution.runHourly(manager)
     end
     SmartDistribution.beginPassProfile()                       -- hourly-pass profiler: zero the clocks + scan counters
     SmartDistribution.invalidatePalletScan()                   -- the pallet-scan cache is PASS-SCOPED: never carry one across
+    SmartDistribution.invalidateShedScan()                     -- ...and so is the shed-read cache
+    SmartDistribution._matBudgetLeft = SmartDistribution.MATERIALISE_BUDGET   -- refill the per-pass materialise budget
     SmartDistribution.invalidateMenuMemos()                    -- the display memos must not carry across a pass
     resetCycleMoney()                                         -- open this hour's money tally (flushed at the END of this tick, after the appended surplus-sell pass)
     -- (no enforceValidModes here any more -- a player's mode is never rewritten; see the note above it)
@@ -16368,6 +16437,7 @@ function SmartDistribution.repairSheds()
             for i = #oss.storedObjects, 1, -1 do
                 if not SmartDistribution.storedObjectIsUsable(oss.storedObjects[i]) then
                     table.remove(oss.storedObjects, i); n = n + 1
+                    SmartDistribution.invalidateShedScan()
                 end
             end
             if n > 0 then
@@ -19486,9 +19556,11 @@ function SmartDistribution.createStoredPallet(shed, ft, litres, farmId)
     if not SmartDistribution.storedObjectIsUsable(obj) then
         table.remove(spec.storedObjects, #spec.storedObjects)        -- roll back rather than leave it
         spec.numStoredObjects = #spec.storedObjects
+        SmartDistribution.invalidateShedScan()
         return false
     end
     spec.numStoredObjects = #spec.storedObjects
+    SmartDistribution.invalidateShedScan()   -- the shed gained an object
     if shed.setObjectStorageObjectInfosDirty ~= nil then shed:setObjectStorageObjectInfosDirty() end
     return true
 end
@@ -19511,6 +19583,33 @@ end
 --
 -- WHOLE PALLETS ONLY. A shed slot holds one pallet and depositPalletsToShed has always required
 -- palletIsFull, so a part-filled pallet cannot be stored; the remainder stays in the tank for next cycle.
+-- PER-PASS BUDGET. Measured 2026-09-09 on the real code: with no budget this fills EVERY FREE SLOT
+-- OF EVERY PALLET SHED ON THE FARM IN ONE PASS -- 7,200 stored pallets built in a single hourly tick
+-- on a 4-shed farm, the count exactly equal to the free slots (drop the sheds to 400 slots and it
+-- builds exactly 800). Each one is a createStoredPallet: an XMLFile document, a schema, six setValue
+-- calls and the game's own loadFromXMLFile object constructor. That is the 2026-09-08 report, whose
+-- pass spent 85,542 of 87,589 ms in storePhase.
+--
+-- WORSE WHEN A SHED DECLARES NO CAPACITY: shedFreeSlots returns math.huge for cap <= 0, so there is
+-- no slot bound at all and the loop is limited only by the tank. The harness hit a 60,000-build cap
+-- still building. The budget is what makes that case finite, which is why it is applied here rather
+-- than by special-casing the capacity.
+--
+-- NOTHING IS LOST, only RATE-LIMITED. The unbuilt remainder stays in the tank and goes next pass --
+-- exactly what this function already does with a sub-pallet remainder, and what happened before
+-- phase 5 existed at all. A shed therefore fills over several in-game hours instead of instantly,
+-- which no player can be harmed by; a one-second hitch every hour is one they would report.
+--
+-- 50/pass is generous against real throughput (50,000 L an hour into one shed, far more than a
+-- production makes) and cheap against the freeze. It is ONE CONSTANT to tune once the profiler's
+-- new store line reports a real per-pallet cost from a farm that has the problem.
+--
+-- SHARED ACROSS THE WHOLE PASS, not per shed: it is the pass's cost that has to be bounded. Sources
+-- are served in the order storePhase walks them, so on a budget-limited pass a later source waits
+-- for the next one rather than being starved -- the budget refills every pass.
+SmartDistribution.MATERIALISE_BUDGET = 50
+SmartDistribution._matBudgetLeft = nil
+
 function SmartDistribution.materialiseToShed(srcP, storage, ft, shed, want, farmId)
     if shed == nil or storage == nil or (want or 0) <= 0 then return 0 end
     if not SmartDistribution.canMaterialisePallets(ft) then return 0 end
@@ -19525,12 +19624,23 @@ function SmartDistribution.materialiseToShed(srcP, storage, ft, shed, want, farm
     local have = getLevel(storage, ft) or 0
     count = math.min(count, math.floor(have / per))
     if count < 1 then return 0 end
+    -- the per-pass budget, above. nil means "not inside a pass" (no caller does that today), which
+    -- keeps the pre-budget behaviour rather than silently refusing.
+    local budget = SmartDistribution._matBudgetLeft
+    if budget ~= nil then
+        if budget <= 0 then return 0 end
+        count = math.min(count, budget)
+    end
     -- BUILT DIRECTLY through the game's own savegame path (6.22): no template, no spawner, no async.
-    local built = 0
+    local built, t0 = 0, (getTimeSec ~= nil) and getTimeSec() or nil
     for _ = 1, count do
         if not SmartDistribution.createStoredPallet(shed, ft, per, farmId) then break end
         built = built + 1
     end
+    local sc = SmartDistribution._scan
+    sc.matCalls, sc.matBuilt = sc.matCalls + 1, sc.matBuilt + built
+    if t0 ~= nil then sc.matMs = sc.matMs + (getTimeSec() - t0) * 1000 end
+    if budget ~= nil then SmartDistribution._matBudgetLeft = budget - built end
     local movedL = built * per
     if movedL <= 0 then
         SmartDistribution.log("materialise %s -> %s [%s]: could not BUILD a stored pallet",
